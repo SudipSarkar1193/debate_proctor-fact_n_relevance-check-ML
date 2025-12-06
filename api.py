@@ -11,6 +11,8 @@ from search_engine import core
 # --- DATA MODELS ---
 class AnalyzeRequest(BaseModel):
     text: str
+    previous_text: Optional[str] = None  # User's previous message (for logic check)
+    topic: str = "Artificial Intelligence" # The Debate Topic (for global check)
 
 class EvidenceItem(BaseModel):
     text: str
@@ -19,26 +21,31 @@ class EvidenceItem(BaseModel):
     similarity: float  
 
 class AnalyzeResponse(BaseModel):
+    # Factual Results
     verdict: str
-    llm_confidence: int
+    factual_score: float
     explanation: str
     
-    # New Math Fields
-    factual_score: float
+    # Relevance Results
+    relevance_score: float
+    discourse_category: str
+    discourse_reason: str
+    
+    # Debug/Math Details
     support_mass: float
     refute_mass: float
     
     evidence: List[EvidenceItem]
 
-# --- APP LIFECYCLE ---
+# --- LIFECYCLE ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("🚀 API Starting...")
     try:
         core.load_brain()
         print("✅ Brain ready!")
-    except:
-        print("❌ Brain failed to load")
+    except Exception as e:
+        print(f"❌ Brain failed to load: {e}")
     yield
     print("💤 API Stopping...")
 
@@ -50,27 +57,25 @@ def analyze_claim(request: AnalyzeRequest):
         raise HTTPException(status_code=400, detail="Empty text")
 
     try:
-        print(f"📨 Analyzing: {request.text[:50]}...")
+        # Call the Orchestrator in core.py
+        result = core.orchestrate_analysis(
+            text=request.text,
+            previous_text=request.previous_text,
+            topic=request.topic
+        )
         
-        # 1. Search
-        facts = core.search(request.text, k=3)
-        
-        # 2. LLM Verify
-        llm_result = core.verify_claim_with_llm(request.text, facts)
-        
-        # 3. Math Calculate
-        math_result = core.calculate_mathematical_score(llm_result, facts)
-        
-        # 4. Return Full Report
+        # Map Dict to Pydantic Model
         return AnalyzeResponse(
-            verdict=llm_result.get("verdict", "ERROR"),
-            llm_confidence=llm_result.get("confidence", 0),
-            explanation=llm_result.get("explanation", "Error"),
+            verdict=result['fact_verdict'],
+            factual_score=result['fact_score'],
+            explanation=result['fact_explanation'],
             
-            # Math Data
-            factual_score=math_result['final_accuracy_score'],
-            support_mass=math_result['support_mass'],
-            refute_mass=math_result['refute_mass'],
+            relevance_score=result['relevance_score'],
+            discourse_category=result['relevance_category'],
+            discourse_reason=result['relevance_reason'],
+            
+            support_mass=result['support_mass'],
+            refute_mass=result['refute_mass'],
             
             evidence=[
                 EvidenceItem(
@@ -78,10 +83,10 @@ def analyze_claim(request: AnalyzeRequest):
                     source=f['source'],
                     url=f['url'],
                     similarity=f['similarity']
-                ) for f in facts
+                ) for f in result['evidence']
             ]
         )
         
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f"❌ API Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
