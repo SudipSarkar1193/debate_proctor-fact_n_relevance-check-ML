@@ -4,10 +4,11 @@ import pickle
 import numpy as np
 import faiss
 import google.generativeai as genai
+from google.generativeai.types import HarmCategory, HarmBlockThreshold
 import json
 import re
 
-# --- 1. PATH FIX ---
+# This tells Python to look in the parent folder for .env and config
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from dotenv import load_dotenv
 
@@ -29,9 +30,10 @@ INDEX = None
 METADATA = None
 
 def load_brain():
-    """Loads the FAISS index and Metadata from disk into RAM."""
+    """Loads the FAISS index and Metadata from disk into the RAM."""
     global INDEX, METADATA
     
+    # Paths are relative to the ROOT folder (one level up)
     base_path = os.path.dirname(os.path.abspath(__file__))
     root_path = os.path.join(base_path, '..')
     
@@ -51,7 +53,7 @@ def load_brain():
 def search(query, k=3):
     """
     1. Embeds the query.
-    2. Searches FAISS.
+    2. Searches FAISS for top K matches.
     3. Calculates Cosine Similarity from L2 Distance.
     """
     if INDEX is None:
@@ -98,7 +100,8 @@ def search(query, k=3):
 
 def verify_claim_with_llm(claim, facts):
     """
-    Asks Gemini to judge the claim based on facts.
+    Asks LLM to judge the claim based on facts.
+    Includes Safety Settings to prevent blocking sensitive topics (e.g. Extinction).
     """
     evidence_text = ""
     for i, f in enumerate(facts):
@@ -126,12 +129,29 @@ def verify_claim_with_llm(claim, facts):
     }}
     """
     
+    # --- SAFETY SETTINGS (Disable filters for debate analysis) ---
+    safety_settings = {
+        HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+        HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+        HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+        HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+    }
+    
     model = genai.GenerativeModel(VERIFIER_MODEL)
+    
     try:
-        response = model.generate_content(prompt, generation_config={"response_mime_type": "application/json"})
+        response = model.generate_content(
+            prompt, 
+            generation_config={"response_mime_type": "application/json"},
+            safety_settings=safety_settings # <--- SAFETY APPLIED HERE
+        )
         return json.loads(response.text)
+        
     except Exception as e:
         print(f"LLM Error: {e}")
+        # If it was a safety block, print the feedback to know for sure
+        if hasattr(e, 'response') and hasattr(e.response, 'prompt_feedback'):
+             print(f"Safety Feedback: {e.response.prompt_feedback}")
         return {"verdict": "ERROR", "confidence": 0, "explanation": "LLM Failure"}
 
 def calculate_mathematical_score(llm_result, facts):
