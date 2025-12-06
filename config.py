@@ -1,6 +1,6 @@
 # Database Credentials
 DB_CONFIG = {
-    "dbname": "pg-debate",
+    "dbname": "debate_app_ai_db",
     "user": "postgres",
     "password": "root", 
     "host": "localhost"
@@ -16,5 +16,5 @@ TARGET_CATEGORIES = [
 ]
 
 # Scraper Settings
-MAX_DEPTH = 3  # How deep to go into subcategories (0 = top level only)
+MAX_DEPTH = 2  # How deep to go into subcategories (0 = top level only)
 USER_AGENT = 'DebateAnalyzer_Bot/1.0 (contact: netajibosethesudip@gmail.com)'
