@@ -35,6 +35,16 @@ def init_db():
     finally:
         conn.close()
 
+def page_exists(pageid):
+    """Checks if a page ID already exists in the DB."""
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM raw_facts WHERE pageid = %s", (pageid,))
+            return cur.fetchone() is not None
+    finally:
+        conn.close()
+
 def save_page(page_data):
     """
     Saves a single page dictionary to the DB.

@@ -18,6 +18,11 @@ def main():
         pages_generator = crawler.fetch_category_pages(category)
         
         for page_data in pages_generator:
+
+            # OPTIMIZATION: Check DB before processing
+            if db.page_exists(page_data['pageid']):
+                print(f"   ⏩ Exists: {page_data['title']}")
+                continue  # Skip to next page immediately
             
             # Simple validation: Skip empty pages
             if not page_data['content']:
