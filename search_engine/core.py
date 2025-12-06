@@ -7,8 +7,7 @@ import google.generativeai as genai
 import json
 import re
 
-# --- 1. PATH FIX (Critical) ---
-# This tells Python to look in the parent folder for .env and config
+# --- 1. PATH FIX ---
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from dotenv import load_dotenv
 
@@ -21,7 +20,7 @@ if not GEMINI_API_KEY:
 
 genai.configure(api_key=GEMINI_API_KEY)
 
-# Settings (Must match what you used in Phase 2)
+# Settings
 MODEL_NAME = "models/text-embedding-004"
 VERIFIER_MODEL = "gemini-2.5-pro" 
 
@@ -33,7 +32,6 @@ def load_brain():
     """Loads the FAISS index and Metadata from disk into RAM."""
     global INDEX, METADATA
     
-    # Paths are relative to the ROOT folder (one level up)
     base_path = os.path.dirname(os.path.abspath(__file__))
     root_path = os.path.join(base_path, '..')
     
@@ -53,13 +51,13 @@ def load_brain():
 def search(query, k=3):
     """
     1. Embeds the query.
-    2. Searches FAISS for top K matches.
-    3. Returns the text facts.
+    2. Searches FAISS.
+    3. Calculates Cosine Similarity from L2 Distance.
     """
     if INDEX is None:
         load_brain()
         
-    print(f"🔍 Searching for: '{query}'")
+    print(f"🔍 Searching for: '{query[:50]}...'")
     
     # 1. Embed Query
     result = genai.embed_content(
@@ -72,86 +70,155 @@ def search(query, k=3):
     # 2. Search Index
     distances, indices = INDEX.search(query_vec, k)
     
-    # 3. Retrieve Text
+    # 3. Retrieve Text & Calculate Math
     results = []
     for i, idx in enumerate(indices[0]):
-        if idx == -1: continue # No match found
+        if idx == -1: continue 
         
-        # FAISS ID -> Metadata List Index
         meta = METADATA[idx]
+        l2_distance = float(distances[0][i])
+        
+        # MATH: Convert L2 Distance to Cosine Similarity
+        # Formula: Similarity = 1 - (Distance^2 / 2)
+        # Note: FAISS returns squared Euclidean distance already
+        similarity = 1 - (l2_distance / 2)
+        
+        # Safety clamp (0.0 to 1.0)
+        similarity = max(0.0, min(1.0, similarity))
         
         results.append({
+            "id": meta['faiss_id'],
             "text": meta['text'],
             "source": meta['title'],
-            "url": meta['url']
+            "url": meta['url'],
+            "similarity": similarity  # <--- CRITICAL FOR SCORING
         })
         
     return results
 
 def verify_claim_with_llm(claim, facts):
     """
-    Sends the Claim + Facts to Gemini to get a Verdict.
+    Asks Gemini to judge the claim based on facts.
     """
-    # Prepare the Evidence Block
     evidence_text = ""
     for i, f in enumerate(facts):
-        evidence_text += f"EVIDENCE #{i+1}:\nSource: {f['source']}\nText: {f['text']}\n\n"
+        # We include similarity in the prompt so the LLM knows which evidence is strongest
+        evidence_text += f"EVIDENCE #{i+1} (Relevance: {f['similarity']:.2f}):\nSource: {f['source']}\nText: {f['text']}\n\n"
         
     prompt = f"""
     SYSTEM: You are a strict debate judge. 
-    You must verify the user's CLAIM based ONLY on the provided EVIDENCE.
+    Compare the USER CLAIM vs the EVIDENCE.
     
     USER CLAIM: "{claim}"
     
     {evidence_text}
     
     INSTRUCTIONS:
-    1. Compare the Claim vs Evidence.
-    2. Determine if the Evidence SUPPORTS, CONTRADICTED, or is UNRELATED to the claim.
-    3. Provide a confidence score (0-100).
-    4. Provide a strict verdict label: "SUPPORTED", "CONTRADICTED", or "NOT_VERIFIABLE".
-    5. Output JSON ONLY.
+    1. Determine if the Evidence SUPPORTS, CONTRADICTED, or is UNRELATED to the claim.
+    2. Provide a confidence score (0-100) for your verdict.
+    3. Output JSON ONLY.
     
     JSON FORMAT:
     {{
         "verdict": "SUPPORTED" | "CONTRADICTED" | "NOT_VERIFIABLE",
         "confidence": <int>,
-        "explanation": "<short sentence citing specific evidence>"
+        "explanation": "<short sentence>"
     }}
     """
     
     model = genai.GenerativeModel(VERIFIER_MODEL)
-    response = model.generate_content(prompt, generation_config={"response_mime_type": "application/json"})
-    
     try:
+        response = model.generate_content(prompt, generation_config={"response_mime_type": "application/json"})
         return json.loads(response.text)
-    except:
-        return {"verdict": "ERROR", "confidence": 0, "explanation": "LLM JSON Error"}
+    except Exception as e:
+        print(f"LLM Error: {e}")
+        return {"verdict": "ERROR", "confidence": 0, "explanation": "LLM Failure"}
 
-# --- TESTING AREA (Run this file to test) ---
+def calculate_mathematical_score(llm_result, facts):
+    """
+    Calculates the Factual Accuracy Score (0-100) using Support vs Refute Mass.
+    """
+    
+    # 1. Get LLM signals
+    verdict = llm_result.get("verdict", "NOT_VERIFIABLE")
+    confidence = llm_result.get("confidence", 0) / 100.0 # Normalize to 0-1
+    
+    # 2. Assign Verdict Weight (w_v)
+    if verdict == "SUPPORTED":
+        w_v = 1.0
+    elif verdict == "CONTRADICTED":
+        w_v = 0.0
+    else:
+        w_v = 0.5 # Neutral
+        
+    support_mass = 0.0
+    refute_mass = 0.0
+    
+    # 3. Calculate Mass for every piece of evidence
+    print("\n🧮 MATH ENGINE:")
+    for f in facts:
+        sim = f['similarity']
+        # Reliability defaults to 0.9 for Wikipedia (could be variable in future)
+        reliability = 0.9 
+        
+        # FORMULAS:
+        # Support Mass (Ei) = Similarity * Confidence * w_v * Reliability
+        e_i = sim * confidence * w_v * reliability
+        
+        # Refute Mass (Ri) = Similarity * Confidence * (1 - w_v) * Reliability
+        r_i = sim * confidence * (1 - w_v) * reliability
+        
+        support_mass += e_i
+        refute_mass += r_i
+        
+        print(f"   - Fact '{f['source']}': Sim={sim:.2f} -> Support={e_i:.2f}, Refute={r_i:.2f}")
+
+    # 4. Final Aggregation
+    total_mass = support_mass + refute_mass
+    epsilon = 1e-9
+    
+    if total_mass < 0.1:
+        # If total mass is tiny, we don't have enough evidence to score
+        raw_score = 0.0
+    else:
+        # Score between -1 (Refuted) and +1 (Supported)
+        raw_score = (support_mass - refute_mass) / (total_mass + epsilon)
+    
+    # Normalize to 0-100 scale
+    final_accuracy = (raw_score + 1) / 2 * 100
+    
+    return {
+        "support_mass": round(support_mass, 4),
+        "refute_mass": round(refute_mass, 4),
+        "raw_score": round(raw_score, 4),
+        "final_accuracy_score": round(final_accuracy, 2)
+    }
+
+# --- TESTING AREA ---
 if __name__ == "__main__":
-    # Test Run
     load_brain()
     
-    # A statement
-    user_queries = ["Generative AI models like Stable Diffusion work by learning statistical patterns from vast datasets of images to create new visual content. Due to copyright concerns regarding this training data, the European Union's AI Act has officially banned the use and development of all generative AI models within Europe as of 2024.","Prominent researchers from organizations like the Future of Life Institute have raised valid concerns that advanced AI systems could pose an existential threat to humanity if not aligned with human values. Because of this misalignment, there is now a unanimous scientific consensus that AI will inevitably cause human extinction by the year 2030."]
+    # Test Claims
+    user_queries = [
+        "Prominent researchers have raised valid concerns that advanced AI systems could pose an existential threat to humanity if not aligned with human values."
+    ]
     
-    
-    for user_query in user_queries :
+    for query in user_queries:
         # 1. Retrieval
-        facts = search(user_query, k=3)
+        facts = search(query)
         
-        print(f"\n📚 Found {len(facts)} relevant facts:")
-        for f in facts:
-            print(f"   - [{f['source']}]: {f['text'][:100]}...")
-            
         # 2. Verification
-        print("\n🤖 Asking Judge (Gemini)...")
-        result = verify_claim_with_llm(user_query, facts)
+        llm_res = verify_claim_with_llm(query, facts)
+        
+        # 3. Math
+        math_res = calculate_mathematical_score(llm_res, facts)
         
         print("\n" + "="*30)
-        print("📢 FINAL VERDICT:")
-        print(f"Verdict: {result['verdict']}")
-        print(f"Confidence: {result['confidence']}%")
-        print(f"Reason: {result['explanation']}")
+        print("📊 FINAL CALCULATION:")
+        print(f"Verdict: {llm_res['verdict']}")
+        print(f"LLM Conf: {llm_res['confidence']}%")
+        print("-" * 15)
+        print(f"Support Mass: {math_res['support_mass']}")
+        print(f"Refute Mass:  {math_res['refute_mass']}")
+        print(f"Factual Acc:  {math_res['final_accuracy_score']}/100")
         print("="*30)

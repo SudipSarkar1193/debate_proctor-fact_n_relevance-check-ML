@@ -5,89 +5,83 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional
 
-# --- 1. PATH FIX ---
-# Allow importing from the search_engine folder
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from search_engine import core
 
-# --- 2. DATA MODELS (The Contract) ---
-# This is what we expect the JS App to send us
+# --- DATA MODELS ---
 class AnalyzeRequest(BaseModel):
     text: str
 
-# This is the structure of a single piece of evidence
 class EvidenceItem(BaseModel):
     text: str
     source: str
     url: str
+    similarity: float  
 
-# This is what we will send back to Java
 class AnalyzeResponse(BaseModel):
     verdict: str
-    confidence: int
+    llm_confidence: int
     explanation: str
+    
+    # New Math Fields
+    factual_score: float
+    support_mass: float
+    refute_mass: float
+    
     evidence: List[EvidenceItem]
 
-# --- 3. LIFECYCLE MANAGER ---
-# This runs once when the server starts (to load the heavy Brain)
+# --- APP LIFECYCLE ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("🚀 API Starting... Waking up the Brain...")
+    print("🚀 API Starting...")
     try:
         core.load_brain()
-        print("✅ Brain is ready!")
-    except Exception as e:
-        print(f"❌ Failed to load brain: {e}")
-        # We don't exit here, so the health check can still report status
+        print("✅ Brain ready!")
+    except:
+        print("❌ Brain failed to load")
     yield
-    print("💤 API Shutting down...")
+    print("💤 API Stopping...")
 
-# --- 4. THE APPLICATION ---
 app = FastAPI(title="Debate Analyzer AI", lifespan=lifespan)
-
-@app.get("/")
-def health_check():
-    """Simple check to see if server is alive."""
-    return {
-        "status": "running", 
-        "brain_loaded": core.INDEX is not None
-    }
 
 @app.post("/analyze", response_model=AnalyzeResponse)
 def analyze_claim(request: AnalyzeRequest):
-    """
-    Main Endpoint:
-    1. Receives a text claim.
-    2. Searches vector DB.
-    3. Asks Gemini for verification.
-    4. Returns JSON result.
-    """
     if not request.text.strip():
-        raise HTTPException(status_code=400, detail="Text cannot be empty")
+        raise HTTPException(status_code=400, detail="Empty text")
 
     try:
-        print(f"📨 Received request: {request.text[:50]}...")
+        print(f"📨 Analyzing: {request.text[:50]}...")
         
-        # A. Retrieval (RAG)
+        # 1. Search
         facts = core.search(request.text, k=3)
         
-        # B. Verification (LLM)
+        # 2. LLM Verify
         llm_result = core.verify_claim_with_llm(request.text, facts)
         
-        # C. Response Formatting
+        # 3. Math Calculate
+        math_result = core.calculate_mathematical_score(llm_result, facts)
+        
+        # 4. Return Full Report
         return AnalyzeResponse(
             verdict=llm_result.get("verdict", "ERROR"),
-            confidence=llm_result.get("confidence", 0),
-            explanation=llm_result.get("explanation", "Processing error"),
+            llm_confidence=llm_result.get("confidence", 0),
+            explanation=llm_result.get("explanation", "Error"),
+            
+            # Math Data
+            factual_score=math_result['final_accuracy_score'],
+            support_mass=math_result['support_mass'],
+            refute_mass=math_result['refute_mass'],
+            
             evidence=[
                 EvidenceItem(
                     text=f['text'],
                     source=f['source'],
-                    url=f['url']
+                    url=f['url'],
+                    similarity=f['similarity']
                 ) for f in facts
             ]
         )
         
     except Exception as e:
-        print(f"❌ Error processing request: {e}")
+        print(f"❌ Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
