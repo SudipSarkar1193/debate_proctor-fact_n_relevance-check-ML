@@ -29,6 +29,7 @@ VECTOR_DIMENSION = 768
 CHUNK_SIZE = 800
 OVERLAP = 100
 BATCH_LIMIT = 100
+CHECKPOINT_INTERVAL = 50  # Auto-save every 50 articles
 
 def setup_gemini():
     genai.configure(api_key=GEMINI_API_KEY)
@@ -65,6 +66,19 @@ def get_batch_embeddings(text_chunks):
             continue
     return all_vectors
 
+def save_checkpoint(index, metadata_list, output_dir):
+    """Helper to save the current state to disk."""
+    index_path = os.path.join(output_dir, "vector_store.index")
+    meta_path = os.path.join(output_dir, "metadata.pkl")
+    
+    # Write FAISS Index
+    faiss.write_index(index, index_path)
+    
+    # Write Metadata
+    with open(meta_path, "wb") as f:
+        pickle.dump(metadata_list, f)
+    print(f"   💾 Checkpoint saved! ({len(metadata_list)} total memories)")
+
 def build_index():
     # 1. Parse Args
     parser = argparse.ArgumentParser(description="Build Vector Index for a specific topic.")
@@ -85,26 +99,18 @@ def build_index():
     index_path = os.path.join(output_dir, "vector_store.index")
     meta_path = os.path.join(output_dir, "metadata.pkl")
 
-    # --- 2. SMART LOADING (INCREMENTAL LOGIC) ---
-    master_embedding_list = []
+    # --- 2. SMART LOADING ---
     metadata_list = []
     existing_titles = set()
     
-    # Try to load existing brain to append to it
     if os.path.exists(index_path) and os.path.exists(meta_path):
         print("🧠 Found existing brain. Loading for incremental update...")
         try:
-            # Load FAISS Index
             index = faiss.read_index(index_path)
-            
-            # Load Metadata
             with open(meta_path, "rb") as f:
                 metadata_list = pickle.load(f)
-            
-            # Create a set of titles we already have
             existing_titles = {item['title'] for item in metadata_list}
             print(f"   ✅ Loaded {len(metadata_list)} existing memories ({len(existing_titles)} unique articles).")
-            
         except Exception as e:
             print(f"   ⚠️ Error loading existing index: {e}. Starting fresh.")
             index = faiss.IndexFlatL2(VECTOR_DIMENSION)
@@ -112,7 +118,7 @@ def build_index():
         print("🆕 No existing brain found. Creating fresh index.")
         index = faiss.IndexFlatL2(VECTOR_DIMENSION)
 
-    # 3. Fetch Data (from specific DB)
+    # 3. Fetch Data
     print(f"📥 Fetching data from {TOPIC_REGISTRY[topic]['db_config']['dbname']}...")
     conn = db.get_connection(topic)
     try:
@@ -122,7 +128,7 @@ def build_index():
     finally:
         conn.close()
     
-    # 4. Filter: Only process NEW articles
+    # 4. Filter New Articles
     new_rows = [r for r in rows if r[1] not in existing_titles]
     
     if not new_rows:
@@ -131,11 +137,10 @@ def build_index():
 
     print(f"   Found {len(rows)} total articles. {len(new_rows)} are NEW. Processing...")
 
-    # Calculate starting ID for FAISS (continuation)
     global_faiss_id = len(metadata_list)
-    new_vectors_count = 0
+    new_vectors_buffer = [] # Temporary buffer for the current batch
     
-    # 5. Process ONLY New Articles
+    # 5. Process Loop
     for idx, row in enumerate(new_rows):
         page_id, title, content, url = row
         
@@ -149,8 +154,9 @@ def build_index():
 
         if not vectors: continue
             
+        # Add to Memory (Buffer)
         for i, vector in enumerate(vectors):
-            master_embedding_list.append(vector)
+            new_vectors_buffer.append(vector)
             metadata_list.append({
                 "faiss_id": global_faiss_id,
                 "title": title,
@@ -158,28 +164,33 @@ def build_index():
                 "url": url
             })
             global_faiss_id += 1
-            new_vectors_count += 1
             
         print(f"   [{idx+1}/{len(new_rows)}] Processed: {title} ({len(chunks)} chunks)")
+        
+        # --- AUTO-SAVE CHECKPOINT ---
+        if (idx + 1) % CHECKPOINT_INTERVAL == 0 and new_vectors_buffer:
+            print(f"\n⚡ Auto-Saving batch of {len(new_vectors_buffer)} vectors...")
+            
+            # Push buffer to FAISS Index
+            batch_matrix = np.array(new_vectors_buffer).astype('float32')
+            index.add(batch_matrix)
+            
+            # Save to Disk
+            save_checkpoint(index, metadata_list, output_dir)
+            
+            # Clear buffer to free memory
+            new_vectors_buffer = []
+            
         time.sleep(1.0) 
 
-    # 6. Save Updates
-    if new_vectors_count > 0:
-        print(f"\n🧠 Adding {new_vectors_count} new vectors to existing index...")
-        
-        # Add new vectors to the existing FAISS index
-        new_matrix = np.array(master_embedding_list).astype('float32')
-        index.add(new_matrix)
-        
-        print(f"💾 Saving updated brain to: {output_dir}")
-        faiss.write_index(index, index_path)
-        
-        with open(meta_path, "wb") as f:
-            pickle.dump(metadata_list, f)
+    # 6. Final Save (For any remaining items in buffer)
+    if new_vectors_buffer:
+        print(f"\n⚡ Saving final batch of {len(new_vectors_buffer)} vectors...")
+        batch_matrix = np.array(new_vectors_buffer).astype('float32')
+        index.add(batch_matrix)
+        save_checkpoint(index, metadata_list, output_dir)
             
-        print(f"✅ DONE! Brain updated. Total memories: {index.ntotal}")
-    else:
-        print("⚠️ No valid vectors generated from new content.")
+    print(f"✅ DONE! Brain updated. Total memories: {index.ntotal}")
 
 if __name__ == "__main__":
     build_index()
