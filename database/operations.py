@@ -1,18 +1,26 @@
 # database/operations.py
 import psycopg2
-from config import DB_CONFIG
+from config import TOPIC_REGISTRY
 
-def get_connection():
-    """Establishes connection to Postgres."""
+def get_connection(topic):
+    """
+    Establishes connection to the SPECIFIC database for the given topic.
+    """
+    if topic not in TOPIC_REGISTRY:
+        raise ValueError(f"❌ Unknown topic: {topic}")
+
+    # Load specific DB config for this topic
+    db_config = TOPIC_REGISTRY[topic]["db_config"]
+    
     try:
-        conn = psycopg2.connect(**DB_CONFIG)
+        conn = psycopg2.connect(**db_config)
         return conn
     except Exception as e:
-        print(f"❌ Database Connection Error: {e}")
+        print(f"❌ Database Connection Error ({topic}): {e}")
         raise e
 
-def init_db():
-    """Creates the necessary table if it doesn't exist."""
+def init_db(topic):
+    """Creates the table in the specific topic's database."""
     create_table_sql = """
     CREATE TABLE IF NOT EXISTS raw_facts (
         pageid INTEGER PRIMARY KEY,
@@ -24,20 +32,20 @@ def init_db():
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     """
-    conn = get_connection()
+    conn = get_connection(topic)
     try:
         with conn.cursor() as cur:
             cur.execute(create_table_sql)
         conn.commit()
-        print("✅ Database initialized (Table 'raw_facts' ready).")
+        print(f"✅ Database initialized for '{topic}' (Table 'raw_facts' ready).")
     except Exception as e:
-        print(f"❌ Error creating table: {e}")
+        print(f"❌ Error creating table for '{topic}': {e}")
     finally:
         conn.close()
 
-def page_exists(pageid):
-    """Checks if a page ID already exists in the DB."""
-    conn = get_connection()
+def page_exists(topic, pageid):
+    """Checks if a page ID already exists in the specific topic DB."""
+    conn = get_connection(topic)
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT 1 FROM raw_facts WHERE pageid = %s", (pageid,))
@@ -45,10 +53,9 @@ def page_exists(pageid):
     finally:
         conn.close()
 
-def save_page(page_data):
+def save_page(topic, page_data):
     """
-    Saves a single page dictionary to the DB.
-    Ignores duplicates using ON CONFLICT.
+    Saves a page to the specific topic's database.
     """
     sql = """
     INSERT INTO raw_facts (pageid, title, url, content, categories)
@@ -56,7 +63,7 @@ def save_page(page_data):
     ON CONFLICT (pageid) DO NOTHING;
     """
     
-    conn = get_connection()
+    conn = get_connection(topic)
     try:
         with conn.cursor() as cur:
             cur.execute(sql, (
@@ -64,12 +71,12 @@ def save_page(page_data):
                 page_data['title'],
                 page_data['url'],
                 page_data['content'],
-                str(page_data['categories']) # Store list as string representation
+                str(page_data['categories'])
             ))
         conn.commit()
         return True
     except Exception as e:
-        print(f"⚠️ DB Error saving '{page_data['title']}': {e}")
+        print(f"⚠️ DB Error saving '{page_data['title']}' to '{topic}': {e}")
         conn.rollback()
         return False
     finally:
