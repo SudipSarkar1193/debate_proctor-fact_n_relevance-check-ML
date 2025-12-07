@@ -1,23 +1,20 @@
 import sys
 import os
+import argparse 
 
-# Add parent directory to path ---
-# This allows the script to see 'database' and 'config' in the main folder
+# Ensure parent directory is in sys.path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-# ---------------------------------------------
+from dotenv import load_dotenv
 
 import time
 import pickle
 import numpy as np
 import faiss
 import google.generativeai as genai
-import os
-from dotenv import load_dotenv
 from database import operations as db
-from config import DB_CONFIG
+from config import TOPIC_REGISTRY 
 
 # --- CONFIGURATION ---
-# Load environment variables
 load_dotenv()
 GEMINI_API_KEY = os.getenv("API_KEY")
 
@@ -26,97 +23,98 @@ if not GEMINI_API_KEY:
 
 # Model Settings
 EMBEDDING_MODEL = "models/text-embedding-004"
-VECTOR_DIMENSION = 768  # Standard for Gemini 004 model
+VECTOR_DIMENSION = 768
 
 # Chunking Settings
-CHUNK_SIZE = 800   # Characters per chunk
-OVERLAP = 100      # Characters of overlap to keep context
-BATCH_LIMIT = 100  # Gemini API limit (items per request)
+CHUNK_SIZE = 800
+OVERLAP = 100
+BATCH_LIMIT = 100
 
 def setup_gemini():
-    """Configures the Gemini API client."""
     genai.configure(api_key=GEMINI_API_KEY)
 
 def simple_chunker(text, chunk_size=CHUNK_SIZE, overlap=OVERLAP):
-    """
-    Splits long text into smaller overlapping chunks.
-    Ensures context is preserved between segments.
-    """
-    if not text:
-        return []
-    
+    if not text: return []
     chunks = []
     start = 0
     text_len = len(text)
-
     while start < text_len:
         end = start + chunk_size
         chunk = text[start:end]
         chunks.append(chunk)
-        
-        # Stop if we reached the end
-        if end >= text_len:
-            break
-            
-        # Move forward, but step back by overlap amount
+        if end >= text_len: break
         start += chunk_size - overlap
-        
     return chunks
 
 def get_batch_embeddings(text_chunks):
-    """
-    Generates embeddings for a list of text chunks using Gemini.
-    CRITICAL: Handles the 100-item API limit by sub-batching.
-    """
-    if not text_chunks:
-        return []
-
+    if not text_chunks: return []
     all_vectors = []
-    
-    # Process in safe sub-batches (e.g., 0-100, 100-200, etc.)
     for i in range(0, len(text_chunks), BATCH_LIMIT):
         batch = text_chunks[i : i + BATCH_LIMIT]
-        
         try:
-            # Gemini API call
             result = genai.embed_content(
                 model=EMBEDDING_MODEL,
                 content=batch,
                 task_type="retrieval_document"
             )
-
-            print(f"🧩 Processed sub-batch {i // BATCH_LIMIT + 1} ({len(batch)} items)")
-            
-            # Extract vectors and add to master list
             if 'embedding' in result:
-                print(f"🧩 Result Structure: {result.keys()}") 
-                # Show first vector's first 5 dimensions just to see what it looks like
-                print(f"👀 Sample Vector (First 5 dims): {result['embedding'][0][:5]} ...")
-
-                print()
-                print("----"*15)
-                print()
-                if len(result['embedding']) > 1:
-                    print(f"👀 Sample Vector (First 5 dims): {result['embedding'][1][:5]} ...")
                 all_vectors.extend(result['embedding'])
-            
-            # Polite sleep between sub-batches
             time.sleep(0.5)
-            
         except Exception as e:
             print(f"   ⚠️ API Error on sub-batch {i}: {e}")
-            # We continue to the next batch instead of crashing
             continue
-
     return all_vectors
 
 def build_index():
-    print("🚀 Starting Phase 2: Building Vector Index...")
+    # 1. Parse Args
+    parser = argparse.ArgumentParser(description="Build Vector Index for a specific topic.")
+    parser.add_argument("--topic", type=str, required=True, help="The topic key (e.g., 'ai', 'aadhaar')")
+    args = parser.parse_args()
+    topic = args.topic.lower()
+
+    if topic not in TOPIC_REGISTRY:
+        print(f"❌ Error: Topic '{topic}' not found in config.")
+        return
+
+    print(f"🚀 Starting Phase 2: Building Brain for [{topic.upper()}]...")
     setup_gemini()
     
-    # 1. Fetch Data
-    print("📥 Fetching data from PostgreSQL...")
-    conn = db.get_connection()
+    # Define Paths
+    output_dir = os.path.join("data", topic)
+    os.makedirs(output_dir, exist_ok=True)
+    index_path = os.path.join(output_dir, "vector_store.index")
+    meta_path = os.path.join(output_dir, "metadata.pkl")
+
+    # --- 2. SMART LOADING (INCREMENTAL LOGIC) ---
+    master_embedding_list = []
+    metadata_list = []
+    existing_titles = set()
+    
+    # Try to load existing brain to append to it
+    if os.path.exists(index_path) and os.path.exists(meta_path):
+        print("🧠 Found existing brain. Loading for incremental update...")
+        try:
+            # Load FAISS Index
+            index = faiss.read_index(index_path)
+            
+            # Load Metadata
+            with open(meta_path, "rb") as f:
+                metadata_list = pickle.load(f)
+            
+            # Create a set of titles we already have
+            existing_titles = {item['title'] for item in metadata_list}
+            print(f"   ✅ Loaded {len(metadata_list)} existing memories ({len(existing_titles)} unique articles).")
+            
+        except Exception as e:
+            print(f"   ⚠️ Error loading existing index: {e}. Starting fresh.")
+            index = faiss.IndexFlatL2(VECTOR_DIMENSION)
+    else:
+        print("🆕 No existing brain found. Creating fresh index.")
+        index = faiss.IndexFlatL2(VECTOR_DIMENSION)
+
+    # 3. Fetch Data (from specific DB)
+    print(f"📥 Fetching data from {TOPIC_REGISTRY[topic]['db_config']['dbname']}...")
+    conn = db.get_connection(topic)
     try:
         cursor = conn.cursor()
         cursor.execute("SELECT pageid, title, content, url FROM raw_facts")
@@ -124,40 +122,35 @@ def build_index():
     finally:
         conn.close()
     
-    print(f"   Found {len(rows)} articles. Beginning vectorization...")
+    # 4. Filter: Only process NEW articles
+    new_rows = [r for r in rows if r[1] not in existing_titles]
+    
+    if not new_rows:
+        print("✨ Brain is already up to date! No new articles to embed.")
+        return
 
-    # FAISS Data Structures
-    master_embedding_list = []
-    metadata_list = [] 
+    print(f"   Found {len(rows)} total articles. {len(new_rows)} are NEW. Processing...")
+
+    # Calculate starting ID for FAISS (continuation)
+    global_faiss_id = len(metadata_list)
+    new_vectors_count = 0
     
-    global_faiss_id = 0
-    
-    # 2. Process Articles
-    for index, row in enumerate(rows):
+    # 5. Process ONLY New Articles
+    for idx, row in enumerate(new_rows):
         page_id, title, content, url = row
         
-        # A. Chunking
         chunks = simple_chunker(content)
-        if not chunks:
-            continue
+        if not chunks: continue
 
-        # B. Embedding (Robust Batching)
         vectors = get_batch_embeddings(chunks)
         
-        # Validation: vectors count must match chunks count (roughly)
-        # If API failed for some batches, we truncate chunks to match vectors length
         if len(vectors) != len(chunks):
-            # Safe fallback: only use chunks we successfully vectorized
             chunks = chunks[:len(vectors)]
 
-        if not vectors:
-            continue
+        if not vectors: continue
             
-        # C. Store in Memory
         for i, vector in enumerate(vectors):
             master_embedding_list.append(vector)
-            
-            # Map this vector ID to the actual text info
             metadata_list.append({
                 "faiss_id": global_faiss_id,
                 "title": title,
@@ -165,35 +158,28 @@ def build_index():
                 "url": url
             })
             global_faiss_id += 1
+            new_vectors_count += 1
             
-        print(f"   [{index+1}/{len(rows)}] Processed: {title} ({len(chunks)} chunks)")
-        
-        # Rate Limit Protection (Sleep between articles)
+        print(f"   [{idx+1}/{len(new_rows)}] Processed: {title} ({len(chunks)} chunks)")
         time.sleep(1.0) 
 
-    # 3. Build & Save FAISS Index
-    total_vectors = len(master_embedding_list)
-    if total_vectors == 0:
-        print("❌ No embeddings were generated. Check API key or Database.")
-        return
-
-    print(f"\n🧠 Building FAISS Index with {total_vectors} vectors...")
-    
-    # Convert to float32 numpy array (Required by FAISS)
-    embedding_matrix = np.array(master_embedding_list).astype('float32')
-    
-    # Create Index
-    index = faiss.IndexFlatL2(VECTOR_DIMENSION)
-    index.add(embedding_matrix)
-    
-    # 4. Save to Disk
-    print("💾 Saving files to disk...")
-    faiss.write_index(index, "vector_store.index")
-    
-    with open("metadata.pkl", "wb") as f:
-        pickle.dump(metadata_list, f)
+    # 6. Save Updates
+    if new_vectors_count > 0:
+        print(f"\n🧠 Adding {new_vectors_count} new vectors to existing index...")
         
-    print(f"✅ DONE! Saved 'vector_store.index' and 'metadata.pkl' ({total_vectors} chunks).")
+        # Add new vectors to the existing FAISS index
+        new_matrix = np.array(master_embedding_list).astype('float32')
+        index.add(new_matrix)
+        
+        print(f"💾 Saving updated brain to: {output_dir}")
+        faiss.write_index(index, index_path)
+        
+        with open(meta_path, "wb") as f:
+            pickle.dump(metadata_list, f)
+            
+        print(f"✅ DONE! Brain updated. Total memories: {index.ntotal}")
+    else:
+        print("⚠️ No valid vectors generated from new content.")
 
 if __name__ == "__main__":
     build_index()
